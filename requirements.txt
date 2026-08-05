@@ -2,6 +2,7 @@ streamlit
 langchain
 langchain-community
 langchain-ollama
+langchain-chroma
 chromadb
 pypdf
 python-dotenv
