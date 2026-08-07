@@ -1,105 +1,119 @@
-from pathlib import Path
-from typing import List, Tuple
+"""
+DocsMind - Backend Pipeline with Conversational Memory
+Handles document loading, chunking, embedding, and a memory-enabled LCEL RAG chain.
+"""
 
-from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
+import os
+from operator import itemgetter
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings, ChatOllama
-from langchain_community.vectorstores import Chroma
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.documents import Document
 
+# New Core Imports for LCEL and Memory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.chat_history import InMemoryChatMessageHistory
 
 class DocsMindPipeline:
-    def __init__(
-        self,
-        persist_directory: str = "chroma_db",
-        embedding_model: str = "nomic-embed-text",
-        llm_model: str = "qwen3.5:0.8b",
-    ):
-        self.persist_directory = persist_directory
-        self.embedding_model = embedding_model
-        self.llm_model = llm_model
+    def __init__(self, persist_dir="./chroma_db", embed_model="nomic-embed-text", llm_model="gemma2:2b"):
+        self.persist_dir = persist_dir
+        self.embeddings = OllamaEmbeddings(model=embed_model)
+        
+        # Increased temperature slightly (0.3) so the AI feels a bit more conversational
+        self.llm = ChatOllama(model=llm_model, temperature=0.3) 
+        self.vector_db = None
+        
+        # Dictionary to store chat histories in memory (Key: session_id, Value: History Object)
+        self.store = {}
+        
+        if os.path.exists(self.persist_dir) and os.listdir(self.persist_dir):
+            self.vector_db = Chroma(persist_directory=self.persist_dir, embedding_function=self.embeddings)
 
-        self.embeddings = OllamaEmbeddings(model=self.embedding_model)
-        self.vectorstore = None
-        self.llm = ChatOllama(model=self.llm_model, temperature=0.2)
+    def process_document(self, file_path: str):
+        """Loads a document, chunks it, and saves it to ChromaDB."""
+        ext = os.path.splitext(file_path)[-1].lower()
+        
+        if ext == '.pdf':
+            loader = PyPDFLoader(file_path)
+        elif ext in ['.docx', '.doc']:
+            loader = Docx2txtLoader(file_path)
+        else:
+            raise ValueError(f"Unsupported file format: {ext}")
+        
+        docs = loader.load()
 
-        self.prompt = ChatPromptTemplate.from_template(
-            """You are DocsMind, a helpful conversational assistant that answers questions only from the provided document context.
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = splitter.split_documents(docs)
 
-If the answer is not present in the context, say you don't know.
-Be concise and conversational.
-
-Conversation history:
-{chat_history}
-
-Context:
-{context}
-
-User question:
-{question}
-
-Answer:
-"""
-        )
-
-    def load_documents(self, file_paths: List[str]) -> List[Document]:
-        documents = []
-        for file_path in file_paths:
-            suffix = Path(file_path).suffix.lower()
-
-            if suffix == ".pdf":
-                loader = PyPDFLoader(file_path)
-            elif suffix == ".txt":
-                loader = TextLoader(file_path, encoding="utf-8")
-            elif suffix == ".docx":
-                loader = Docx2txtLoader(file_path)
-            else:
-                raise ValueError(f"Unsupported file type: {suffix}")
-
-            documents.extend(loader.load())
-        return documents
-
-    def split_documents(self, documents: List[Document]) -> List[Document]:
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-        )
-        return splitter.split_documents(documents)
-
-    def create_vectorstore(self, documents: List[Document]):
-        chunks = self.split_documents(documents)
-        self.vectorstore = Chroma.from_documents(
+        self.vector_db = Chroma.from_documents(
             documents=chunks,
             embedding=self.embeddings,
-            persist_directory=self.persist_directory,
+            persist_directory=self.persist_dir
         )
-        return self.vectorstore
+        return len(chunks)
 
-    def load_vectorstore(self):
-        self.vectorstore = Chroma(
-            persist_directory=self.persist_directory,
-            embedding_function=self.embeddings,
+    def _format_docs(self, docs):
+        """Internal helper to format retrieved documents."""
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    def get_session_history(self, session_id: str) -> InMemoryChatMessageHistory:
+        """Retrieves or creates a chat history for a specific session."""
+        if session_id not in self.store:
+            self.store[session_id] = InMemoryChatMessageHistory()
+        return self.store[session_id]
+
+    def chat_stream(self, user_query: str, session_id: str = "default_session"):
+        """Builds a memory-enabled LCEL chain and streams the response token-by-token."""
+        if not self.vector_db:
+            yield "Please upload and process a document first."
+            return
+
+        retriever = self.vector_db.as_retriever(search_kwargs={"k": 3})
+
+        system_prompt = (
+            "You are DocsMind, a helpful AI assistant. "
+            "If user asks a question, retrieve relevant context from the uploaded document and answer based on that. "
+            "Use the following pieces of retrieved context to answer the user's question. "
+            "If the answer is not in the context, say 'I don't know based on the provided document'. "
+            "Do not hallucinate external information.\n\n"
+            "If user asks simple questions like hello, how are you, knowledge question or other casual greetings, respond in a friendly manner without using the document context.\n\n"
+            "Context:\n{context}"
         )
-        return self.vectorstore
 
-    def add_documents(self, file_paths: List[str]):
-        documents = self.load_documents(file_paths)
-        return self.create_vectorstore(documents)
+        # Updated Prompt: Added MessagesPlaceholder for the "history" variable
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "{input}")
+        ])
 
-    def retrieve(self, question: str, k: int = 4) -> List[Document]:
-        if self.vectorstore is None:
-            self.load_vectorstore()
-        return self.vectorstore.similarity_search(question, k=k)
-
-    def generate_answer(self, question: str, chat_history: str = "") -> Tuple[str, List[Document]]:
-        docs = self.retrieve(question)
-        context = "\n\n".join(doc.page_content for doc in docs)
-
-        messages = self.prompt.format_messages(
-            chat_history=chat_history,
-            context=context,
-            question=question,
+        # ---------------------------------------------------------
+        # THE LCEL PIPELINE (With Memory Prep)
+        # ---------------------------------------------------------
+        rag_chain = (
+            # .assign keeps 'input' and 'history', and dynamically calculates 'context'
+            RunnablePassthrough.assign(
+                context=itemgetter("input") | retriever | self._format_docs
+            )
+            | prompt_template
+            | self.llm
+            | StrOutputParser()
         )
-        response = self.llm.invoke(messages)
-        return response.content, docs
+
+        # Wrap the core chain in the Memory handler
+        conversational_rag_chain = RunnableWithMessageHistory(
+            rag_chain,
+            self.get_session_history,
+            input_messages_key="input",
+            history_messages_key="history",
+        )
+
+        # Execute the stream. Notice we must pass a dictionary with "input" now.
+        for chunk in conversational_rag_chain.stream(
+            {"input": user_query},
+            config={"configurable": {"session_id": session_id}}
+        ):
+            yield chunk
