@@ -71,7 +71,7 @@ class DocsMindPipeline:
             yield "Please upload and process a document first."
             return
 
-        retriever = self.vector_db.as_retriever(search_kwargs={"k": 3})
+        retriever = self.vector_db.as_retriever(search_kwargs={"k": 5})
 
         system_prompt = (
             "You are DocsMind, a helpful AI assistant. "
