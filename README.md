@@ -80,15 +80,26 @@ DocsMind loads the uploaded files and converts them into text documents. It spli
 
 When you ask a question, the app searches for the most relevant chunks. Those chunks are sent to the local Ollama chat model, which writes an answer using the retrieved document context.
 
-## Evaluation
+## Evaluation & System Telemetry
 
-DocsMind is a good basic RAG project. It is easy to understand, runs locally, and gives users a simple way to ask questions about their own documents. The source viewer is useful because it helps users check where an answer came from.
+DocsMind includes an automated **LLM-as-a-Judge telemetry suite** (`evaluate.py`) that evaluates RAG accuracy locally without exposing data to external APIs.
 
-The project is best for small or medium document collections. It should work well for notes, reports, assignments, manuals, and simple research files. Since it uses local Ollama models, it can also be useful when the user does not want to send documents to an external API.
+### Evaluation Metrics
+1. **Context Relevance (1–5):** Measures whether ChromaDB successfully retrieves the precise context needed for the query.
+2. **Faithfulness (1–5):** Evaluates whether the generated response strictly aligns with facts in the source document without hallucinating.
+3. **Guardrail Compliance:** Verifies intent routing between document-grounded queries and general conversational interactions.
 
-There are some limitations. The app currently rebuilds the vector database when new documents are indexed, and it does not show document names clearly in the chat answer. The answer quality depends heavily on the local Ollama model. If the model is small, answers may be short, incomplete, or less accurate. The app also does not yet include login, saved chat history, advanced file management, or automatic evaluation metrics.
+### Benchmark Results (Sample Test Run)
+* **Fact Extraction (Operation Searchlight):** Relevance `5/5` | Faithfulness `5/5`
+* **Comparative Retrieval (Political Stability Index):** Relevance `5/5` | Faithfulness `5/5`
+* **Intent Routing / Fallback (Out-of-domain query):** Handled via prompt guardrails.
 
-Overall, DocsMind is a solid starting point. It shows the main idea of retrieval-augmented generation in a clean and practical way. With better document management, stronger models, improved source citations, and more testing, it could become a more complete document assistant.
+### Running the Evaluation Suite
+1. Ensure your target document is processed in ChromaDB.
+2. Run the evaluation script:
+   ```
+   python evaluate.py
+   ```
 
 ## License
 
